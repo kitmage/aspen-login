@@ -14,6 +14,7 @@ if (!defined('ABSPATH')) {
 
 define('ASPEN_INTENDED_COOKIE', 'aspen_intended_path');
 define('ASPEN_INTENDED_TTL', 15 * MINUTE_IN_SECONDS);
+define('ASPEN_INTENDED_EXCLUSIONS_OPTION', 'aspen_intended_exclusion_slugs');
 
 /**
  * Sanitize an intended destination into a safe on-site path with optional query.
@@ -61,6 +62,10 @@ function aspen_sanitize_intended_path($value) {
     }
 
     if (str_contains($lower_path, 'admin-ajax.php')) {
+        return '';
+    }
+
+    if (aspen_matches_intended_exclusion_slug($only_path)) {
         return '';
     }
 
@@ -148,7 +153,11 @@ function aspen_is_excluded_intended_uri($uri) {
         }
     }
 
-    return str_contains($path, 'admin-ajax.php');
+    if (str_contains($path, 'admin-ajax.php')) {
+        return true;
+    }
+
+    return aspen_matches_intended_exclusion_slug($path);
 }
 
 /**
@@ -180,12 +189,198 @@ function aspen_store_intended_path() {
 add_action('init', 'aspen_store_intended_path');
 
 /**
+ * Get configured partial-match exclusion slugs.
+ *
+ * @return string[] Normalized exclusion slugs.
+ */
+function aspen_get_intended_exclusion_slugs() {
+    $raw_slugs = get_option(ASPEN_INTENDED_EXCLUSIONS_OPTION, []);
+
+    if (is_string($raw_slugs)) {
+        $raw_slugs = preg_split('/[\r\n,]+/', $raw_slugs);
+    }
+
+    if (!is_array($raw_slugs)) {
+        return [];
+    }
+
+    $slugs = [];
+    foreach ($raw_slugs as $slug) {
+        $slug = trim(wp_unslash((string) $slug));
+        $slug = trim($slug, " \t\n\r\0\x0B/");
+
+        if ($slug === '') {
+            continue;
+        }
+
+        $slugs[] = strtolower(sanitize_text_field($slug));
+    }
+
+    return array_values(array_unique($slugs));
+}
+
+/**
+ * Sanitize exclusion slugs before saving settings.
+ *
+ * @param mixed $value Submitted option value.
+ * @return string[] Normalized exclusion slugs.
+ */
+function aspen_sanitize_intended_exclusion_slugs($value) {
+    if (!is_array($value)) {
+        $value = preg_split('/[\r\n,]+/', (string) $value);
+    }
+
+    $sanitized = [];
+    foreach ($value as $slug) {
+        $slug = trim(wp_unslash((string) $slug));
+        $slug = trim($slug, " \t\n\r\0\x0B/");
+
+        if ($slug === '') {
+            continue;
+        }
+
+        $sanitized[] = strtolower(sanitize_text_field($slug));
+    }
+
+    return array_values(array_unique($sanitized));
+}
+
+/**
+ * Check if a URI or path matches a configured exclusion slug.
+ *
+ * @param string $uri URI, path, or URL to inspect.
+ * @return bool Whether the URI should bypass this plugin's redirect system.
+ */
+function aspen_matches_intended_exclusion_slug($uri) {
+    if (!$uri || !is_string($uri)) {
+        return false;
+    }
+
+    if (preg_match('~^https?://~i', $uri)) {
+        $uri = parse_url($uri, PHP_URL_PATH) ?: '';
+    }
+
+    $path = parse_url($uri, PHP_URL_PATH) ?: $uri;
+    $path = '/' . ltrim(strtolower(rawurldecode($path)), '/');
+
+    foreach (aspen_get_intended_exclusion_slugs() as $slug) {
+        if (str_contains($path, strtolower($slug))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+/**
+ * Check whether the current request matches a configured exclusion slug.
+ *
+ * @return bool Whether the current request should bypass plugin URL rewrites.
+ */
+function aspen_current_request_matches_intended_exclusion_slug() {
+    return aspen_matches_intended_exclusion_slug($_SERVER['REQUEST_URI'] ?? '');
+}
+
+/**
+ * Register the settings page and option for custom exclusions.
+ */
+function aspen_register_intended_settings() {
+    register_setting(
+        'aspen_intended_login',
+        ASPEN_INTENDED_EXCLUSIONS_OPTION,
+        [
+            'type'              => 'array',
+            'sanitize_callback' => 'aspen_sanitize_intended_exclusion_slugs',
+            'default'           => [],
+        ]
+    );
+
+    add_settings_section(
+        'aspen_intended_exclusions_section',
+        __('Exclusion Slugs', 'aspen-intended-login'),
+        'aspen_intended_exclusions_section_callback',
+        'aspen-intended-login'
+    );
+
+    add_settings_field(
+        'aspen_intended_exclusion_slugs_field',
+        __('Bypass slugs', 'aspen-intended-login'),
+        'aspen_intended_exclusion_slugs_field_callback',
+        'aspen-intended-login',
+        'aspen_intended_exclusions_section'
+    );
+}
+add_action('admin_init', 'aspen_register_intended_settings');
+
+/**
+ * Add the Aspen Intended Login settings submenu under Settings.
+ */
+function aspen_add_intended_settings_page() {
+    add_options_page(
+        __('Aspen Intended Login', 'aspen-intended-login'),
+        __('Aspen Intended Login', 'aspen-intended-login'),
+        'manage_options',
+        'aspen-intended-login',
+        'aspen_render_intended_settings_page'
+    );
+}
+add_action('admin_menu', 'aspen_add_intended_settings_page');
+
+/**
+ * Explain the custom exclusions setting.
+ */
+function aspen_intended_exclusions_section_callback() {
+    echo '<p>' . esc_html__('Add one slug or partial path per line. If a request path contains any of these values, Aspen Intended Login will not store it, redirect to it, or rewrite its login/register URLs. Force Login will also be bypassed for matching paths.', 'aspen-intended-login') . '</p>';
+}
+
+/**
+ * Render the exclusion slugs textarea.
+ */
+function aspen_intended_exclusion_slugs_field_callback() {
+    $value = implode("\n", aspen_get_intended_exclusion_slugs());
+
+    printf(
+        '<textarea name="%1$s" id="%1$s" rows="8" cols="50" class="large-text code" placeholder="teams\nwc-memberships\nmember-registration">%2$s</textarea>',
+        esc_attr(ASPEN_INTENDED_EXCLUSIONS_OPTION),
+        esc_textarea($value)
+    );
+
+    echo '<p class="description">' . esc_html__('Partial matches are supported. For example, “teams” matches /my-account/teams/register/ and /teams-for-memberships/.', 'aspen-intended-login') . '</p>';
+}
+
+/**
+ * Render the settings page.
+ */
+function aspen_render_intended_settings_page() {
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+    ?>
+    <div class="wrap">
+        <h1><?php echo esc_html(get_admin_page_title()); ?></h1>
+        <form action="options.php" method="post">
+            <?php
+            settings_fields('aspen_intended_login');
+            do_settings_sections('aspen-intended-login');
+            submit_button();
+            ?>
+        </form>
+    </div>
+    <?php
+}
+
+/**
  * Force register links to the public registration page and preserve redirect_to.
  *
  * @param string $register_url Default register URL.
  * @return string
  */
 function aspen_register_url($register_url) {
+    if (aspen_current_request_matches_intended_exclusion_slug()) {
+        return $register_url;
+    }
+
     $register = home_url('/register/');
     $candidate = $_REQUEST['redirect_to'] ?? ($_COOKIE[ASPEN_INTENDED_COOKIE] ?? '');
     $path = aspen_sanitize_intended_path($candidate);
@@ -267,6 +462,10 @@ function aspen_forcelogin_bypass($bypass, $visited_url) {
         return true;
     }
 
+    if (aspen_matches_intended_exclusion_slug($visited_url)) {
+        return true;
+    }
+
     return $bypass;
 }
 add_filter('v_forcelogin_bypass', 'aspen_forcelogin_bypass', 10, 2);
@@ -280,6 +479,10 @@ add_filter('v_forcelogin_bypass', 'aspen_forcelogin_bypass', 10, 2);
  * @return string
  */
 function aspen_login_url($login_url, $redirect, $force_reauth) {
+    if (aspen_current_request_matches_intended_exclusion_slug()) {
+        return $login_url;
+    }
+
     return home_url('/login/');
 }
 add_filter('login_url', 'aspen_login_url', 10, 3);
